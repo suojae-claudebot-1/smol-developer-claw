@@ -78,7 +78,7 @@ def _write_all(recs: List[ActionApproval]) -> None:
 
 async def enqueue_action(platform: str, action: str, text: str, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     rec = ActionApproval(
-        id=str(uuid.uuid4())[:8],
+        id=str(uuid.uuid4()),
         platform=platform,
         action=action,
         text=text,
