@@ -7,13 +7,14 @@ without any Discord dependency.
 import asyncio
 import sys
 from collections import OrderedDict
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from src.config import CONFIG, DEFAULT_MODEL
+from src.config import CONFIG, DEFAULT_MODEL, MODEL_ALIASES
 from src.domain.action_parser import (
     ACTION_MAP,
     MAX_ACTIONS_PER_MESSAGE,
     escape_mentions,
+    parse_actions,
     parse_kv_body,
     strip_actions,
     parse_review_body,
@@ -24,10 +25,12 @@ from src.domain.action_parser import (
     parse_read_file_body,
     parse_get_pr_diff_body,
 )
+from src.domain.models import ActionBlock
 from src.ports.inbound import IncomingMessage
 from src.ports.outbound import ApprovalPort, GitHubPort, LLMPort, NotificationPort
 
 _TRUNCATE_LIMIT = 8000
+_DISCORD_MSG_LIMIT = 2000
 
 
 def _log(msg: str):
@@ -72,32 +75,55 @@ class AgentBrain:
         primary_team_channel_id: int = 0,
     ):
         self.bot_name = bot_name
-        self._aliases: List[str] = aliases or []
         self.persona = persona
         self.own_channel_id = own_channel_id
+        self.executor = executor
+
+        # Public via properties
+        self._aliases: List[str] = aliases or []
         self._primary_team_channel_id = primary_team_channel_id
         self._team_channel_ids = team_channel_ids or set()
-        self.executor = executor
         self._github = github
         self._notification = notification
         self._approval = approval
+        self._current_model: str = DEFAULT_MODEL
+        self._max_bot_chain: int = 3
+        self._suppress_bot_replies: bool = False
+
         self._action_lock = asyncio.Lock()
         self._channel_history: OrderedDict[int, List[Dict[str, str]]] = OrderedDict()
         self._max_history = 10
-        self._current_model: str = DEFAULT_MODEL
         self._active: bool = True
         self._rehired: bool = False
         self._active_tasks: Dict[int, asyncio.Task] = {}
         self._bot_chain_count: Dict[int, int] = {}
-        self._max_bot_chain: int = 3
-        self._suppress_bot_replies: bool = False
 
         # Callback for getting a channel reference (set by Discord adapter)
         self._get_channel: Optional[Callable] = None
         # Callback for checking if connection is closed
         self._is_closed: Optional[Callable] = None
 
-    # -- Public properties for team manager / adapter access --
+    # ── Public properties ────────────────────────────────────
+
+    @property
+    def aliases(self) -> List[str]:
+        return self._aliases
+
+    @property
+    def team_channel_ids(self) -> set:
+        return self._team_channel_ids
+
+    @property
+    def notification(self) -> Optional[NotificationPort]:
+        return self._notification
+
+    @property
+    def current_model(self) -> str:
+        return self._current_model
+
+    @property
+    def max_bot_chain(self) -> int:
+        return self._max_bot_chain
 
     @property
     def active(self) -> bool:
@@ -135,6 +161,8 @@ class AgentBrain:
         self._channel_history.clear()
         _log(f"[{self.bot_name}] conversation history cleared")
 
+    # ── Message routing ──────────────────────────────────────
+
     def should_respond(self, msg: IncomingMessage) -> bool:
         """Determine if this brain should respond to the message."""
         if not self._active:
@@ -162,6 +190,8 @@ class AgentBrain:
             return cmd
         return None
 
+    # ── Bot chain control (domain logic) ─────────────────────
+
     def get_chain_count(self, channel_id: int) -> int:
         """Get current bot chain count for a channel."""
         return self._bot_chain_count.get(channel_id, 0)
@@ -175,6 +205,25 @@ class AgentBrain:
         self._suppress_bot_replies = False
         self._bot_chain_count[channel_id] = 0
 
+    def check_and_update_chain(self, msg: IncomingMessage) -> bool:
+        """Check bot chain status and update counters.
+
+        Returns True if the message should be processed, False if suppressed.
+        """
+        if msg.is_bot:
+            self.increment_chain(msg.channel_id)
+            if self.get_chain_count(msg.channel_id) > self._max_bot_chain:
+                _log(f"[{self.bot_name}] chain limit reached in ch={msg.channel_id}")
+                self._suppress_bot_replies = True
+                return False
+        else:
+            self.reset_chain(msg.channel_id)
+        return True
+
+    def suppress_bot_replies(self):
+        """Suppress bot replies (e.g. after !cancel)."""
+        self._suppress_bot_replies = True
+
     def cancel_own_tasks(self) -> int:
         """Cancel all of this brain's active tasks across all channels."""
         cancelled = 0
@@ -183,6 +232,8 @@ class AgentBrain:
                 task.cancel()
                 cancelled += 1
         return cancelled
+
+    # ── Context & history ────────────────────────────────────
 
     def build_context(self, channel_id: int, user_message: str) -> str:
         """Build LLM context from persona + history."""
@@ -220,7 +271,41 @@ class AgentBrain:
             history = history[-self._max_history * 2:]
         self._channel_history[channel_id] = history
 
-    # -- GitHub action execution --
+    # ── LLM call + action parsing (shared logic) ────────────
+
+    async def process_message(self, msg: IncomingMessage) -> Optional[Tuple[str, List[ActionBlock]]]:
+        """Run LLM and parse response into text + actions.
+
+        Returns (raw_response, actions) or None on failure.
+        Sends typing indicator and clean text via notification.
+        """
+        if not self.executor or not self._notification:
+            return None
+
+        await self._notification.send_typing(msg.channel_id)
+
+        context = self.build_context(msg.channel_id, msg.content)
+        try:
+            response = await self.executor.execute(
+                msg.content,
+                system_prompt=context,
+                model=MODEL_ALIASES[self._current_model],
+            )
+        except Exception as e:
+            _log(f"[{self.bot_name}] LLM error: {e}")
+            return None
+
+        actions = parse_actions(response)
+        clean = strip_actions(response)
+        if clean:
+            safe = escape_mentions(clean)
+            for chunk in self._split_message(safe):
+                await self._notification.send(msg.channel_id, chunk)
+
+        self.save_to_history(msg.channel_id, msg.content, response[:200])
+        return response, actions
+
+    # ── GitHub action execution ──────────────────────────────
 
     async def _execute_review_pr(self, body: str) -> str:
         """Execute REVIEW_PR action."""
@@ -367,7 +452,7 @@ class AgentBrain:
         except Exception as e:
             return f"[{self.bot_name}] 파일 읽기 에러: {e}"
 
-    # -- Action dispatch --
+    # ── Action dispatch ──────────────────────────────────────
 
     async def execute_action(self, action_type: str, body: str,
                              channel_id: int = 0, author: str = "") -> str:
@@ -408,7 +493,7 @@ class AgentBrain:
         return f"[{self.bot_name}] 처리되지 않은 액션: {action_type}"
 
     @staticmethod
-    def _split_message(text: str, limit: int = 2000) -> List[str]:
+    def _split_message(text: str, limit: int = _DISCORD_MSG_LIMIT) -> List[str]:
         """Split a message into chunks that fit Discord's character limit."""
         if len(text) <= limit:
             return [text]

@@ -23,7 +23,7 @@ def _log(msg: str):
 
 
 def _create_executor():
-    """Create an executor for all bots.
+    """Create a single shared executor for all bots.
 
     Tries real AI executor first (ClaudeExecutor/CodexExecutor),
     falls back to local passthrough if unavailable.
@@ -82,6 +82,7 @@ def _build_bots():
         team_ids.add(test_ch)
 
     github = _create_github_client()
+    shared_executor = _create_executor()
     bots = []
 
     # TeamLead — special adapter with team management
@@ -90,7 +91,7 @@ def _build_bots():
         lead_brain = AgentBrain(
             bot_name="TeamLead",
             persona=TEAM_LEAD_PERSONA,
-            executor=_create_executor(),
+            executor=shared_executor,
             github=github,
             own_channel_id=DISCORD_CHANNELS["lead"],
             team_channel_ids=team_ids,
@@ -103,7 +104,7 @@ def _build_bots():
     else:
         _log("Skipping TeamLead — DISCORD_LEAD_TOKEN not set")
 
-    # Sub-bots
+    # Sub-bots — all share the same executor instance
     for key, persona, token_key, aliases in _BOT_DEFS:
         token = DISCORD_TOKENS[token_key]
         if not token:
@@ -112,7 +113,7 @@ def _build_bots():
         brain = AgentBrain(
             bot_name=aliases[0],
             persona=persona,
-            executor=_create_executor(),
+            executor=shared_executor,
             github=github,
             own_channel_id=DISCORD_CHANNELS[key],
             team_channel_ids=team_ids,

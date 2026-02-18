@@ -122,36 +122,33 @@ async def approve_and_execute(rec_id: str, github_client) -> Dict[str, Any]:
             return {"success": False, "error": f"invalid_status:{target.status}"}
         _update_status(rec_id, "approved")
 
-    try:
-        from src.domain.action_parser import parse_kv_body
-        fields = parse_kv_body(target.text)
+        try:
+            from src.domain.action_parser import parse_kv_body
+            fields = parse_kv_body(target.text)
 
-        if target.action == "create_pr":
-            result = await github_client.create_pr(
-                title=fields.get("title", ""),
-                body=fields.get("body", ""),
-                head=fields.get("head", ""),
-                base=fields.get("base", "main"),
-            )
-        elif target.action == "merge_pr":
-            pr_number = int(fields.get("pr_number", "0"))
-            method = fields.get("method", "squash")
-            result = await github_client.merge_pr(pr_number, method)
-        else:
-            raise ValueError(f"unsupported action: {target.action}")
+            if target.action == "create_pr":
+                result = await github_client.create_pr(
+                    title=fields.get("title", ""),
+                    body=fields.get("body", ""),
+                    head=fields.get("head", ""),
+                    base=fields.get("base", "main"),
+                )
+            elif target.action == "merge_pr":
+                pr_number = int(fields.get("pr_number", "0"))
+                method = fields.get("method", "squash")
+                result = await github_client.merge_pr(pr_number, method)
+            else:
+                raise ValueError(f"unsupported action: {target.action}")
 
-        if result.success:
-            async with _file_lock:
+            if result.success:
                 _update_status(rec_id, "executed", result_url=result.url)
-            return {"success": True, "url": result.url}
-        else:
-            async with _file_lock:
+                return {"success": True, "url": result.url}
+            else:
                 _update_status(rec_id, "failed", error=result.error)
-            return {"success": False, "error": result.error}
-    except Exception as e:
-        async with _file_lock:
+                return {"success": False, "error": result.error}
+        except Exception as e:
             _update_status(rec_id, "failed", error=str(e))
-        return {"success": False, "error": str(e)}
+            return {"success": False, "error": str(e)}
 
 
 async def reject(rec_id: str) -> Dict[str, Any]:

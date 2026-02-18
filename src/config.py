@@ -44,6 +44,8 @@ if DEFAULT_MODEL not in MODEL_ALIASES:
     )
     DEFAULT_MODEL = fallback
 
+API_KEY = os.getenv("API_KEY", "")
+
 CONFIG = {
     "port": 3000,
     "session_id": str(uuid.uuid4()),

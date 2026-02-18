@@ -2,6 +2,7 @@
 
 import asyncio
 import sys
+import threading
 from typing import List, Optional
 
 from src.config import CONFIG
@@ -24,6 +25,7 @@ class GitHubClient:
         self._repo_name = repo or CONFIG["github_repo"]
         self._gh = None
         self._repo = None
+        self._init_lock = threading.Lock()
 
     @property
     def is_configured(self) -> bool:
@@ -31,9 +33,11 @@ class GitHubClient:
 
     def _ensure_client(self):
         if self._gh is None:
-            from github import Github
-            self._gh = Github(self._token)
-            self._repo = self._gh.get_repo(self._repo_name)
+            with self._init_lock:
+                if self._gh is None:  # double-check after acquiring lock
+                    from github import Github
+                    self._gh = Github(self._token)
+                    self._repo = self._gh.get_repo(self._repo_name)
 
     async def review_pr(self, pr_number: int, body: str, event: str = "COMMENT") -> GitHubResult:
         try:

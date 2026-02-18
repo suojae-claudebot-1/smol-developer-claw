@@ -94,8 +94,6 @@ class ClaudeExecutor:
             "--print",
             "--session-id",
             session_id or str(uuid.uuid4()),
-            "--permission-mode",
-            "bypassPermissions",
             "--output-format",
             "text",
         ]

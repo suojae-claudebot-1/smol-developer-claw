@@ -62,14 +62,14 @@ class DiscordBotAdapter(discord.Client):
             author_id=message.author.id,
             is_bot=message.author.bot,
             is_mention=is_mention,
-            is_team_channel=message.channel.id in self._brain._team_channel_ids,
+            is_team_channel=message.channel.id in self._brain.team_channel_ids,
             is_own_channel=message.channel.id == self._brain.own_channel_id,
         )
 
     def _is_role_mentioned(self, message: discord.Message) -> bool:
         if not message.role_mentions or not self.user:
             return False
-        bot_names = {self._brain.bot_name.lower()} | {a.lower() for a in self._brain._aliases}
+        bot_names = {self._brain.bot_name.lower()} | {a.lower() for a in self._brain.aliases}
         return any(role.name.lower() in bot_names for role in message.role_mentions)
 
     def _is_text_mentioned(self, content: str) -> bool:
@@ -78,7 +78,7 @@ class DiscordBotAdapter(discord.Client):
         names = {self._brain.bot_name, self.user.name}
         if self.user.display_name:
             names.add(self.user.display_name)
-        names.update(self._brain._aliases)
+        names.update(self._brain.aliases)
         content_lower = content.lower()
         return any(f"@{name.lower()}" in content_lower for name in names)
 
@@ -99,15 +99,9 @@ class DiscordBotAdapter(discord.Client):
                 self._brain.reset_chain(incoming.channel_id)
             return
 
-        # Chain control for bot-to-bot messages
-        if incoming.is_bot:
-            self._brain.increment_chain(incoming.channel_id)
-            if self._brain.get_chain_count(incoming.channel_id) > self._brain._max_bot_chain:
-                _log(f"[{self._brain.bot_name}] chain limit reached in ch={incoming.channel_id}")
-                self._brain._suppress_bot_replies = True
-                return
-        else:
-            self._brain.reset_chain(incoming.channel_id)
+        # Chain control — delegated to domain
+        if not self._brain.check_and_update_chain(incoming):
+            return
 
         # Check for commands
         cmd = self._brain.is_command(incoming.content)
@@ -120,13 +114,13 @@ class DiscordBotAdapter(discord.Client):
 
     async def _handle_command(self, cmd: str, msg: IncomingMessage):
         """Dispatch command to AgentBrain."""
-        notification = self._brain._notification
+        notification = self._brain.notification
         if not notification:
             return
 
         if cmd == "!cancel":
             count = self._brain.cancel_own_tasks()
-            self._brain._suppress_bot_replies = True
+            self._brain.suppress_bot_replies()
             if msg.is_own_channel:
                 await notification.send(msg.channel_id, f"[{self._brain.bot_name}] {count}개 작업 취소됨.")
 
@@ -145,40 +139,22 @@ class DiscordBotAdapter(discord.Client):
             await notification.send(msg.channel_id, help_text)
 
     async def _respond(self, msg: IncomingMessage):
-        """Run LLM and send response."""
-        if not self._brain.executor or not self._brain._notification:
+        """Run LLM via AgentBrain.process_message and execute actions."""
+        result = await self._brain.process_message(msg)
+        if not result:
             return
 
-        from src.config import MODEL_ALIASES
-        from src.domain.action_parser import parse_actions, strip_actions, escape_mentions
-
-        await self._brain._notification.send_typing(msg.channel_id)
-
-        context = self._brain.build_context(msg.channel_id, msg.content)
-        try:
-            response = await self._brain.executor.execute(
-                msg.content,
-                system_prompt=context,
-                model=MODEL_ALIASES[self._brain._current_model],
-            )
-        except Exception as e:
-            _log(f"[{self._brain.bot_name}] LLM error: {e}")
-            return
-
-        # Parse and execute action blocks
-        actions = parse_actions(response)
-        clean = strip_actions(response)
-        if clean:
-            safe = escape_mentions(clean)
-            for chunk in self._brain._split_message(safe):
-                await self._brain._notification.send(msg.channel_id, chunk)
+        response, actions = result
+        notification = self._brain.notification
 
         for action in actions:
-            result = await self._brain.execute_action(
-                action.action_type, action.body,
-                channel_id=msg.channel_id, author=msg.author_name,
-            )
-            if result:
-                await self._brain._notification.send(msg.channel_id, result)
+            action_result = await self._execute_single_action(action, msg.channel_id, msg.author_name)
+            if action_result and notification:
+                await notification.send(msg.channel_id, action_result)
 
-        self._brain.save_to_history(msg.channel_id, msg.content, response[:200])
+    async def _execute_single_action(self, action, channel_id: int, author: str) -> str:
+        """Execute a single action. Override in subclasses for custom handling."""
+        return await self._brain.execute_action(
+            action.action_type, action.body,
+            channel_id=channel_id, author=author,
+        )
