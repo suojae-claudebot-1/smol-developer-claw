@@ -6,12 +6,9 @@ Pure Python, no framework dependencies.
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING, Dict, List, Tuple
+from typing import Dict, List, Tuple
 
 from src.domain.models import ActionBlock
-
-if TYPE_CHECKING:
-    from src.domain.alarm import AlarmEntry
 
 # Action block regex: [ACTION:TYPE] ... [/ACTION]
 ACTION_RE = re.compile(
@@ -28,8 +25,6 @@ ACTION_MAP: Dict[str, Tuple[str, str]] = {
     "MERGE_PR": ("github", "merge_pr"),
     "READ_FILE": ("github", "read_file"),
     "GET_PR_DIFF": ("github", "get_pr_diff"),
-    "SET_ALARM": ("alarm", "set"),
-    "CANCEL_ALARM": ("alarm", "cancel"),
     "FIRE_BOT": ("team", "fire"),
     "HIRE_BOT": ("team", "hire"),
     "STATUS_REPORT": ("team", "status"),
@@ -109,20 +104,3 @@ def parse_read_file_body(body: str) -> Dict[str, str]:
 def parse_get_pr_diff_body(body: str) -> Dict[str, str]:
     """Parse GET_PR_DIFF body — pr_number."""
     return parse_kv_body(body)
-
-
-def format_schedule(alarm: "AlarmEntry") -> str:
-    """Format alarm schedule for display."""
-    if alarm.schedule_type == "daily":
-        return f"매일 {alarm.hour:02d}:{alarm.minute:02d}"
-    elif alarm.schedule_type == "weekday":
-        return f"평일 {alarm.hour:02d}:{alarm.minute:02d}"
-    elif alarm.schedule_type == "interval":
-        if alarm.interval_minutes >= 60 and alarm.interval_minutes % 60 == 0:
-            return f"{alarm.interval_minutes // 60}시간마다"
-        return f"{alarm.interval_minutes}분마다"
-    elif alarm.schedule_type == "once":
-        if alarm.interval_minutes >= 60 and alarm.interval_minutes % 60 == 0:
-            return f"{alarm.interval_minutes // 60}시간 후 1회"
-        return f"{alarm.interval_minutes}분 후 1회"
-    return alarm.schedule_type
